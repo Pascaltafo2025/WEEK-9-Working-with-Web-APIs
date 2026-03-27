@@ -1,0 +1,26 @@
+---
+title: "Data transformation Using a New York Times API in R"
+author: "Pascal Hermann Kouogang Tafo"
+format: html
+editor: visual
+---
+
+## INTRODUCTION
+
+This assignment consists of using the **New York Times Article Search API** to examine how the *volume* and *framing* of soccer coverage in the New York Times has evolved since the modern Major League Soccer (MLS) expansion era began in 2005.In fact d,API provides rich article-level metadata such as headline, publication date, section name, news desk, word count, and multimedia flags since 1851, making it well suited for detecting decade-long window in editorial attention and story framing by querying the keyword **"soccer"**.
+
+------------------------------------------------------------------------
+
+## APPROACH
+
+Below is a structured workflow approach to accomplish our goal and answer our question:
+
+1)  Use a **securely stored environment** variable to **Access the NYT Article Search** and prevent API key exposure
+
+2)  **Filter** and **Collect** the most recent articles containing the keyword "soccer" at request time to ensure a contemporary dataset. The result will contain several fields as nested lists such as "headline", "keywords", "byline\`", "multimedia" etc...
+
+3)  Then i will **parse** each paginated JSON response into a data frame specifically by **extracting only** the sub-fields i need and collapsing arrays to scalar values.
+
+4)  Finally, **clean the data** to calculate which newspaper sections are producing the most content on **"SOCCER"**.
+
+------------------------------------------------------------------------
