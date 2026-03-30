@@ -1,0 +1,322 @@
+---
+title: "Data transformation Using a New York Times API in R"
+author: "Pascal Hermann Kouogang Tafo"
+format: html
+editor: visual
+---
+
+## INTRODUCTION
+
+This assignment consists of using the **New York Times Article Search API** to examine how the *volume* and *framing* of soccer coverage in the New York Times has evolved since the modern Major League Soccer (MLS) expansion era began in 2005.In fact d,API provides rich article-level metadata such as headline, publication date, section name, news desk, word count, and multimedia flags since 1851, making it well suited for detecting decade-long window in editorial attention and story framing by querying the keyword **"soccer"**.
+
+------------------------------------------------------------------------
+
+## APPROACH
+
+Below is a structured workflow approach to accomplish our goal and answer our question:
+
+1)  Use a **securely stored environment** variable to **Access the NYT Article Search** and prevent API key exposure
+
+2)  **Filter** and **Collect** the most recent articles containing the keyword "soccer" at request time to ensure a contemporary dataset. The result will contain several fields as nested lists such as "headline", "keywords", "byline\`", "multimedia" etc...
+
+3)  Then i will **parse** each paginated JSON response into a data frame specifically by **extracting only** the sub-fields i need and collapsing arrays to scalar values.
+
+4)  Finally, **clean the data** to calculate which newspaper sections are producing the most content on **"SOCCER"**.
+
+------------------------------------------------------------------------
+
+## Loading the useful libraries
+
+```{r}
+
+library(httr2)       # Modern HTTP client
+library(jsonlite)    # JSON parsing
+library(tidyverse)   # Data wrangling + ggplot2
+library(lubridate)   # Date handling
+library(glue)        # String interpolation
+library(scales)      # Plot axis formatting
+```
+
+------------------------------------------------------------------------
+
+## Let's authenticate our API Key
+
+In this section, i created an account into the New York Times developer portal and i enabled the "Article Search API" and "Most Popular API" to generate an API Key that i securely stored in R through my console to prevent it to be exposed.
+
+```{r}
+
+NYT_API_KEY <- Sys.getenv("NYT_API_KEY")
+
+if (nchar(NYT_API_KEY) == 0) {
+  stop(
+    "NYT API key not found.\n",
+    "  Option A (recommended): add  NYT_API_KEY=your_key  to ~/.Renviron, then restart R.\n",
+    "  Option B: assign directly:  NYT_API_KEY <- 'your_key'"
+  )
+}
+
+BASE_URL <- "https://api.nytimes.com/svc/search/v2/articlesearch.json"
+
+```
+
+------------------------------------------------------------------------
+
+## Let's BUILD THE REQUEST to the Endpoint & Collect DATA
+
+The NYT API provides 10 results per page and maintains a set limit of roughly 12 requests per minute. The script iterates through pages, pausing to remain polite and automatically manage any HTTP 429 rate-limit responses.
+
+```{r}
+
+#' we start by Fetching one page of NYT article search results
+#'
+#' @param query      Search string
+#' @param year       4-digit year (integer)
+#' @param page       0-based page index
+#' @param api_key    NYT API key string
+#' @return           Raw parsed list from the JSON response, or NULL on error
+
+fetch_nyt_page <- function(query, year, page = 0, api_key) {
+
+  begin_date <- glue("{year}0101")
+  end_date   <- glue("{year}1231")
+
+  resp <- request(BASE_URL) |>
+    req_url_query(
+      q          = query,
+      begin_date = begin_date,
+      end_date   = end_date,
+      page       = page,
+      sort       = "oldest",
+      `api-key`  = api_key
+    ) |>
+    req_error(is_error = \(r) FALSE) |>   # handle HTTP errors manually
+    req_perform()
+
+  if (resp_status(resp) != 200) {
+    warning(glue("HTTP {resp_status(resp)} for year={year} page={page}"))
+    return(NULL)
+  }
+
+  resp |> resp_body_json(simplifyVector = FALSE)
+}
+
+
+#' Now, let's Collect articles across multiple pages for a single year
+#'
+#' @param query     Search string
+#' @param year      4-digit year
+#' @param max_pages Max pages to retrieve per year (10 articles each)
+#' @param api_key   NYT API key
+#' @return          List of article metadata lists
+
+
+fetch_year <- function(query, year, max_pages = 5, api_key) {
+
+  all_docs <- list()
+
+  for (pg in seq(0, max_pages - 1)) {
+    message(glue("  Fetching year={year} page={pg} ..."))
+    result <- fetch_nyt_page(query, year, pg, api_key)
+
+    if (is.null(result)) break
+
+    hits  <- result$response$meta$hits %||% 0
+    docs  <- result$response$docs
+
+    if (length(docs) == 0) break
+
+    all_docs <- c(all_docs, docs)
+
+    # Stop early if we've retrieved all available articles
+    if (length(all_docs) >= hits) break
+
+    Sys.sleep(6.5)   # Stay within 10 req/min rate limit
+  }
+
+  all_docs
+}
+
+# ── Query parameters ──────────────────────────────────────────────────────────
+
+SEARCH_QUERY <- "soccer MLS"
+START_YEAR   <- 2005
+END_YEAR     <- as.integer(format(Sys.Date(), "%Y"))
+MAX_PAGES    <- 5          # Up to 50 articles per year; increase for deeper pull
+
+message(glue("\nFetching NYT soccer coverage: {START_YEAR}–{END_YEAR}\n"))
+
+raw_articles <- list()
+
+for (yr in START_YEAR:END_YEAR) {
+  yr_docs          <- fetch_year(SEARCH_QUERY, yr, MAX_PAGES, NYT_API_KEY)
+  raw_articles[[as.character(yr)]] <- yr_docs
+  message(glue("  → {length(yr_docs)} articles retrieved for {yr}"))
+  Sys.sleep(2)
+}
+
+
+```
+
+## LET'S PARSE THE JSON RESPONSE
+
+Since each article doc is a nested list, we will extract the fields we need.
+
+```{r PARSE-JSON-RESPONSE}
+
+# Safely extract a nested field (returns NA if missing)
+
+safe_pluck <- function(x, ...) {
+  tryCatch(purrr::pluck(x, ...) %||% NA_character_, error = \(e) NA_character_)
+}
+
+parse_article <- function(doc) {
+  tibble(
+    article_id    = safe_pluck(doc, "_id"),
+    pub_date      = safe_pluck(doc, "pub_date"),
+    headline      = safe_pluck(doc, "headline", "main"),
+    abstract      = safe_pluck(doc, "abstract"),
+    lead_paragraph= safe_pluck(doc, "lead_paragraph"),
+    section       = safe_pluck(doc, "section_name"),
+    desk          = safe_pluck(doc, "news_desk"),
+    doc_type      = safe_pluck(doc, "document_type"),
+    word_count    = as.integer(safe_pluck(doc, "word_count") %||% NA),
+    web_url       = safe_pluck(doc, "web_url"),
+    # Combine all keywords into a semicolon-separated string
+    keywords      = {
+      kws <- doc$keywords
+      if (length(kws) > 0) {
+        paste(sapply(kws, \(k) k$value %||% ""), collapse = "; ")
+      } else NA_character_
+    }
+  )
+}
+
+```
+
+------------------------------------------------------------------------
+
+## LET'S TRANSFORM THE JSON RESPONSE INTO A CLEAN DATA FRAME
+
+```{r}
+
+# Step 1: Flatten year buckets into a single list of docs
+
+articles_df <- raw_articles |>
+  purrr::list_flatten() |>
+  purrr::map(parse_article) |>
+  purrr::list_rbind() |>
+
+# Step 2: Let's transform raw date strings into structured time components.
+  mutate(
+    pub_date   = ymd_hms(pub_date, quiet = TRUE),
+    year       = year(pub_date),
+    month      = month(pub_date),
+    quarter    = quarter(pub_date),
+    year_month = floor_date(pub_date, "month")
+  ) |>
+
+  # Step 3: Framing (These classify each article's emphasis based on headline + abstract text.)
+  
+  mutate(
+    text_combined = str_to_lower(paste(headline, abstract, lead_paragraph, sep = " ")),
+
+    frame_growth      = str_detect(text_combined,
+                          "expansion|grow|record|attendance|stadium|franchise|invest"),
+    frame_mls         = str_detect(text_combined, "\\bmls\\b|major league soccer"),
+    frame_usmnt       = str_detect(text_combined,
+                          "u\\.s\\. national|usmnt|uswnt|world cup|pulisic|reyna"),
+    frame_global      = str_detect(text_combined,
+                          "premier league|champions league|barcelona|real madrid|messi|ronaldo"),
+    frame_transfer    = str_detect(text_combined,
+                          "transfer|signing|contract|deal|salary|designated player"),
+    frame_youth       = str_detect(text_combined,
+                          "youth|academy|college|high school|young"),
+    frame_culture     = str_detect(text_combined,
+                          "culture|fan|supporter|diverse|immigrant|latino|community"),
+
+# Step 4: perform conditional labeling (first match wins; "Other" if none)
+
+    framing = case_when(
+      frame_mls      ~ "MLS / League",
+      frame_usmnt    ~ "US National Team",
+      frame_global   ~ "Global / Club",
+      frame_transfer ~ "Transfers & Business",
+      frame_growth   ~ "Growth & Infrastructure",
+      frame_youth    ~ "Youth & Development",
+      frame_culture  ~ "Culture & Fandom",
+      TRUE           ~ "Other / General"
+    )
+  ) |>
+
+# Step 5: Let's Deduplicate the process and clean the data
+  
+  distinct(article_id, .keep_all = TRUE) |>
+  filter(!is.na(pub_date), year >= START_YEAR) |>
+  arrange(pub_date)
+
+message(glue("\nFinal dataset: {nrow(articles_df)} unique articles ({START_YEAR}–{END_YEAR})"))
+
+head(articles_df,10)
+
+```
+
+## As a result, our dataframe contains 142 unique articles of 142 rows and 24 columns including article_id, pulication date, headline, doc_type, etc...
+
+## ANALYSIS & VISUALISATIONS
+
+### 1. Annual article volume
+
+Here, we will analyze and visualize the NYT Soccer Coverage Volume since MLS Expansion Era.
+
+```{r}
+
+annual_volume <- articles_df |>
+  count(year, name = "n_articles")
+
+annual_volume
+
+ggplot(annual_volume, aes(x = year, y = n_articles)) +
+  geom_col(fill = "#003087", alpha = 0.85) +
+  geom_smooth(method = "loess", se = TRUE, colour = "#E31837", linewidth = 1) +
+  scale_x_continuous(breaks = seq(START_YEAR, END_YEAR, 2)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "NYT Soccer Coverage Volume: MLS Expansion Era",
+    subtitle = glue("Articles matching '{SEARCH_QUERY}', {START_YEAR}–{END_YEAR}"),
+    x = NULL, y = "Number of Articles",
+    caption  = "Source: NYT Article Search API"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+```
+
+### 2) Framing breakdown by year
+
+```{r}
+framing_year <- articles_df |>
+  count(year, framing) |>
+  group_by(year) |>
+  mutate(pct = n / sum(n))
+framing_year
+
+p2 <- ggplot(framing_year, aes(x = year, y = pct, fill = framing)) +
+  geom_area(alpha = 0.85, colour = "white", linewidth = 0.3) +
+  scale_x_continuous(breaks = seq(START_YEAR, END_YEAR, 2)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "How NYT Soccer Coverage is Framed Over Time",
+    subtitle = "Share of articles by dominant frame, per year",
+    x = NULL, y = "Share of Articles", fill = "Frame",
+    caption  = "Source: NYT Article Search API"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title   = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(p2)
+```
